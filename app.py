@@ -135,9 +135,8 @@ def load_data():
     with st.spinner('Fetching latest merit data...'):
         # Fetch merit data - trying multiple possible URLs
         urls = [
-            "https://loyce.club/all_merit.txt",
-            "https://loyce.club/merit/all_merit.txt",
-            "https://loyce.club/meritdata/all_merit.txt"
+            "http://loyce.club/Merit/usernames.html",
+            "http://loyce.club/Merit/merit.html",
         ]
         
         merit_text = None
@@ -152,9 +151,8 @@ def load_data():
         
         # Fetch merit sources - trying multiple possible URLs
         source_urls = [
-            "https://loyce.club/merit_sources.txt",
-            "https://loyce.club/merit/merit_sources.txt",
-            "https://loyce.club/meritdata/merit_sources.txt"
+            "http://loyce.club/Merit/usernames.html",
+            "http://loyce.club/Merit/merit.html",
         ]
         
         sources_text = None
