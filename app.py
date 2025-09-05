@@ -1,559 +1,428 @@
 # app.py
-import streamlit as st
+import re
+import os
+import io
+import sys
+import time
+import math
+import requests
+from datetime import datetime
+from urllib.parse import urljoin
+
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta
+
+import streamlit as st
+from streamlit.runtime.scriptrunner.script_run_context import add_script_run_ctx
+
 import plotly.express as px
-import plotly.graph_objects as go
-from io import StringIO
-import time
-import re
 
-# Set page configuration
-st.set_page_config(
-    page_title="MeritPulse - Bitcointalk Merit Analysis",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Config
+DATA_URL = "https://loyce.club/Merit/merit.all.txt"
+CACHE_DIR = ".cache_merit"
+PROCESSED_PARQUET = os.path.join(CACHE_DIR, "merit_processed.parquet")
+RAW_CACHE = os.path.join(CACHE_DIR, "merit_raw.txt")
+FORUM_TOPIC_BASE = "https://bitcointalk.org/index.php?topic="  # append topic id and .msg... if needed
 
-# Add custom CSS for styling
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 1rem;
-    }
-    .subheader {
-        font-size: 1.5rem;
-        color: #2c3e50;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 0.5rem;
-        padding: 1rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        overflow: hidden;
-        perspective: 1px;
-    }
-    .stButton>button {
-        width: 100%;
-    }
-    .source-table {
-        font-size: 0.8rem;
-    }
-    @media (max-width: 768px) {
-        .main-header {
-            font-size: 2rem;
-        }
-    }
-</style>
-""", unsafe_allow_html=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# App title and description
-st.markdown('<h1 class="main-header">MeritPulse</h1>', unsafe_allow_html=True)
-st.markdown("### Track and analyze Bitcointalk merit source activity in real-time")
+st.set_page_config(page_title="Bitcointalk Merit Dashboard", layout="wide")
 
-# Function to fetch data with caching
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_data(url):
+# ---------------------
+# Utilities and parsing
+# ---------------------
+@st.cache_data(show_spinner=False)
+def download_raw(url: str, force: bool = False, timeout: int = 15) -> str:
+    """
+    Download raw text file with retries, save to RAW_CACHE and return content as string.
+    If RAW_CACHE exists and not force, will reuse it.
+    """
+    if os.path.exists(RAW_CACHE) and not force:
+        with open(RAW_CACHE, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    headers = {"User-Agent": "merit-dashboard/1.0 (+https://example.com)"}
+    tries = 3
+    for attempt in range(tries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            text = resp.text
+            with open(RAW_CACHE, "w", encoding="utf-8") as f:
+                f.write(text)
+            return text
+        except Exception as e:
+            if attempt + 1 == tries:
+                raise
+            time.sleep(1 + attempt * 2)
+    raise RuntimeError("Failed to download file")
+
+# Example input line variants (unknown file format). We'll attempt flexible parsing:
+# Some likely formats (examples):
+# from:123 to:456 amount:1 date:2009-01-02 topic:789 board:45
+# 123 -> 456 | 1 merit | 2009-01-02 | topic=789 board=45
+# 123 456 1 2009-01-02 789 45
+# Or CSV-like lines.
+# We'll parse using regex to extract ID-like integers and dates and amounts.
+
+date_patterns = [
+    # yyyy-mm-dd or yyyy/mm/dd
+    r"(\d{4}-\d{2}-\d{2})",
+    r"(\d{4}/\d{2}/\d{2})",
+    # dd-mon-yyyy or dd Mon yyyy
+    r"(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})",
+]
+
+def try_parse_date(s: str):
+    for pat in date_patterns:
+        m = re.search(pat, s)
+        if m:
+            txt = m.group(1)
+            for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%d %B %Y"):
+                try:
+                    return datetime.strptime(txt, fmt)
+                except Exception:
+                    pass
+    # fallback: try to parse any ISO-like token
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching data from {url}: {e}")
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+def parse_line(line: str):
+    """
+    Returns dict or None.
+    Try to extract:
+        from_id, to_id, amount (int), date (datetime), topic_id, board_id
+    """
+    s = line.strip()
+    if not s:
         return None
 
-# Function to parse merit data
-def parse_merit_data(data_text):
-    if data_text is None:
-        return pd.DataFrame()
-        
-    lines = data_text.strip().split('\n')
-    merit_data = []
-    
-    for line in lines:
-        if line.startswith('#'):
-            continue
-            
-        parts = line.split('\t')
-        if len(parts) >= 4:
-            try:
-                date_str = parts[0].strip()
-                giver_id = parts[1].strip()
-                receiver_id = parts[2].strip()
-                amount = int(parts[3].strip())
-                
-                # Parse date (assuming format: YYYY-MM-DD HH:MM:SS)
-                date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-                
-                merit_data.append({
-                    'date': date,
-                    'giver_id': giver_id,
-                    'receiver_id': receiver_id,
-                    'amount': amount
-                })
-            except (ValueError, IndexError):
-                continue
-                
-    return pd.DataFrame(merit_data)
+    # quick tokenization (non-digit separators)
+    # Extract all integers (sequences of digits). We'll then try to assign meaning by position/keywords.
+    ints = re.findall(r"\d+", s)
+    # Extract amounts: "merit" or "amount" nearby
+    amount = None
+    m = re.search(r"(?:amount|merit|merits)\s*[:=]?\s*(\d+)", s, flags=re.I)
+    if m:
+        amount = int(m.group(1))
 
-# Function to parse merit sources
-def parse_merit_sources(source_text):
-    if source_text is None:
-        return pd.DataFrame()
-        
-    lines = source_text.strip().split('\n')
-    sources = []
-    
-    for line in lines:
-        if line.startswith('#'):
-            continue
-            
-        parts = line.split('\t')
-        if len(parts) >= 2:
-            try:
-                user_id = parts[0].strip()
-                username = parts[1].strip()
-                sources.append({
-                    'user_id': user_id,
-                    'username': username
-                })
-            except (ValueError, IndexError):
-                continue
-                
-    return pd.DataFrame(sources)
+    # from/to keywords
+    from_id = None
+    to_id = None
+    m_from = re.search(r"(?:from|sender|by)\s*[:=]?\s*(\d+)", s, flags=re.I)
+    m_to = re.search(r"(?:to|receiver)\s*[:=]?\s*(\d+)", s, flags=re.I)
+    if m_from:
+        from_id = int(m_from.group(1))
+    if m_to:
+        to_id = int(m_to.group(1))
 
-# Load data function
-def load_data():
-    with st.spinner('Fetching latest merit data...'):
-        # Fetch merit data from the provided URL
-        merit_text = fetch_data("https://loyce.club/Merit/merit.all.txt")
-        
-        if merit_text is None:
-            st.error("Failed to fetch merit data. Using sample data instead.")
-            return create_sample_data()
-        
-        # Try to fetch merit sources from possible URLs
-        source_urls = [
-            "https://loyce.club/merit_sources.txt",
-            "https://loyce.club/Merit/merit_sources.txt"
-        ]
-        
-        sources_text = None
-        for url in source_urls:
-            sources_text = fetch_data(url)
-            if sources_text is not None:
-                break
-                
-        if sources_text is None:
-            st.warning("Failed to fetch merit sources. Proceeding with merit data only.")
-            sources_df = pd.DataFrame(columns=['user_id', 'username'])
-        else:
-            sources_df = parse_merit_sources(sources_text)
-    
-    # Parse merit data
-    merit_df = parse_merit_data(merit_text)
-    
-    if merit_df.empty:
-        st.error("Parsed merit data is empty. Using sample data instead.")
-        return create_sample_data()
-    
-    # Merge to get usernames if we have sources data
-    if not sources_df.empty:
-        merit_df = merit_df.merge(sources_df, left_on='giver_id', right_on='user_id', how='left')
-        merit_df.rename(columns={'username': 'giver_username'}, inplace=True)
-        
-        merit_df = merit_df.merge(sources_df, left_on='receiver_id', right_on='user_id', how='left')
-        merit_df.rename(columns={'username': 'receiver_username'}, inplace=True)
-    
-    # Fill NaN usernames with user IDs
-    if 'giver_username' not in merit_df.columns:
-        merit_df['giver_username'] = merit_df['giver_id']
-    else:
-        merit_df['giver_username'] = merit_df['giver_username'].fillna(merit_df['giver_id'])
-        
-    if 'receiver_username' not in merit_df.columns:
-        merit_df['receiver_username'] = merit_df['receiver_id']
-    else:
-        merit_df['receiver_username'] = merit_df['receiver_username'].fillna(merit_df['receiver_id'])
-    
-    return merit_df, sources_df
+    # topic/board keywords
+    topic_id = None
+    board_id = None
+    m_topic = re.search(r"(?:topic|topicid|topic_id)\s*[:=]?\s*(\d+)", s, flags=re.I)
+    m_board = re.search(r"(?:board|boardid|board_id)\s*[:=]?\s*(\d+)", s, flags=re.I)
+    if m_topic:
+        topic_id = int(m_topic.group(1))
+    if m_board:
+        board_id = int(m_board.group(1))
 
-# Function to create sample data for demo purposes
-def create_sample_data():
-    # Create sample merit data
-    dates = pd.date_range(start='2023-01-01', end=datetime.now(), freq='H')
-    sample_size = min(5000, len(dates))
-    
-    merit_data = []
-    for i in range(sample_size):
-        date = dates[i]
-        giver_id = f"user_{np.random.randint(1, 50)}"
-        receiver_id = f"user_{np.random.randint(51, 150)}"
-        amount = np.random.choice([1, 2, 3, 4, 5], p=[0.5, 0.3, 0.1, 0.07, 0.03])
-        
-        merit_data.append({
-            'date': date,
-            'giver_id': giver_id,
-            'receiver_id': receiver_id,
-            'amount': amount
-        })
-    
-    merit_df = pd.DataFrame(merit_data)
-    
-    # Create sample sources
-    sources_data = []
-    for i in range(1, 151):
-        sources_data.append({
-            'user_id': f"user_{i}",
-            'username': f"SampleUser{i}"
-        })
-    
-    sources_df = pd.DataFrame(sources_data)
-    
-    # Merge to get usernames
-    merit_df = merit_df.merge(sources_df, left_on='giver_id', right_on='user_id', how='left')
-    merit_df.rename(columns={'username': 'giver_username'}, inplace=True)
-    
-    merit_df = merit_df.merge(sources_df, left_on='receiver_id', right_on='user_id', how='left')
-    merit_df.rename(columns={'username': 'receiver_username'}, inplace=True)
-    
-    return merit_df, sources_df
+    # If keywords absent, heuristically map integers:
+    # typical order: from to amount date topic board or from to amount topic board date
+    if not (from_id and to_id):
+        # if there are at least 2 ints, assume first=from second=to
+        if len(ints) >= 2:
+            if from_id is None:
+                from_id = int(ints[0])
+            if to_id is None:
+                to_id = int(ints[1])
 
-# Calculate metrics and prepare data for visualization
-def prepare_visualization_data(merit_df):
-    # Calculate date 30 days ago
-    thirty_days_ago = datetime.now() - timedelta(days=30)
-    
-    # Filter data for last 30 days
-    recent_merit_df = merit_df[merit_df['date'] >= thirty_days_ago]
-    
-    # Top merit sources (all time)
-    top_sources_alltime = merit_df.groupby(['giver_id', 'giver_username']).agg({
-        'amount': ['sum', 'count']
-    }).reset_index()
-    top_sources_alltime.columns = ['giver_id', 'giver_username', 'total_merit', 'total_transactions']
-    top_sources_alltime = top_sources_alltime.sort_values('total_merit', ascending=False)
-    
-    # Top merit sources (last 30 days)
-    top_sources_recent = recent_merit_df.groupby(['giver_id', 'giver_username']).agg({
-        'amount': ['sum', 'count']
-    }).reset_index()
-    top_sources_recent.columns = ['giver_id', 'giver_username', 'recent_merit', 'recent_transactions']
-    top_sources_recent = top_sources_recent.sort_values('recent_merit', ascending=False)
-    
-    # Timeline data for last 30 days
-    timeline_data = recent_merit_df.groupby(recent_merit_df['date'].dt.date).agg({
-        'amount': 'sum',
-        'giver_id': 'count'
-    }).reset_index()
-    timeline_data.columns = ['date', 'total_merit', 'transaction_count']
-    
-    return top_sources_alltime, top_sources_recent, timeline_data, recent_merit_df
+    # amount fallback
+    if amount is None:
+        # attempt to take the third integer as amount if sensible (small number)
+        if len(ints) >= 3:
+            cand = int(ints[2])
+            # accept if not a year-like number
+            if cand < 1000:
+                amount = cand
 
-# Create visualizations
-def create_visualizations(timeline_data, top_sources_alltime, top_sources_recent):
-    # Create merit timeline chart
-    fig_timeline = px.area(
-        timeline_data, 
-        x='date', 
-        y='total_merit',
-        title='Merit Given Over Time (Last 30 Days)',
-        labels={'date': 'Date', 'total_merit': 'Total Merit'}
-    )
-    fig_timeline.update_layout(
-        xaxis=dict(rangeslider=dict(visible=True)),
-        height=400
-    )
-    
-    # Create top sources chart (all time)
-    fig_top_alltime = px.bar(
-        top_sources_alltime.head(10),
-        x='giver_username',
-        y='total_merit',
-        title='Top 10 Merit Sources (All Time)',
-        labels={'giver_username': 'Username', 'total_merit': 'Total Merit Given'}
-    )
-    fig_top_alltime.update_layout(height=400)
-    
-    # Create top sources chart (last 30 days)
-    fig_top_recent = px.bar(
-        top_sources_recent.head(10),
-        x='giver_username',
-        y='recent_merit',
-        title='Top 10 Merit Sources (Last 30 Days)',
-        labels={'giver_username': 'Username', 'recent_merit': 'Merit Given'}
-    )
-    fig_top_recent.update_layout(height=400)
-    
-    return fig_timeline, fig_top_alltime, fig_top_recent
+    # topic/board fallback from later ints
+    if topic_id is None and len(ints) >= 4:
+        try:
+            topic_id = int(ints[3])
+        except:
+            topic_id = None
+    if board_id is None and len(ints) >= 5:
+        try:
+            board_id = int(ints[4])
+        except:
+            board_id = None
 
-# Display metrics
-def display_metrics(merit_df, recent_merit_df):
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_merit = merit_df['amount'].sum()
-        st.metric("Total Merit Given", f"{total_merit:,}")
-    
-    with col2:
-        total_transactions = len(merit_df)
-        st.metric("Total Transactions", f"{total_transactions:,}")
-    
-    with col3:
-        recent_merit = recent_merit_df['amount'].sum()
-        st.metric("Merit Given (30 Days)", f"{recent_merit:,}")
-    
-    with col4:
-        recent_transactions = len(recent_merit_df)
-        st.metric("Transactions (30 Days)", f"{recent_transactions:,}")
+    # parse date
+    date = try_parse_date(s)
 
-# User search functionality
-def user_search(merit_df, sources_df):
-    st.markdown("---")
-    st.markdown('<div class="subheader">Search Merit Source Activity</div>', unsafe_allow_html=True)
-    
-    # Create search options
-    search_col1, search_col2 = st.columns([2, 1])
-    
-    with search_col1:
-        search_options = ['By Username', 'By User ID']
-        search_method = st.radio("Search by:", search_options, horizontal=True)
-    
-    with search_col2:
-        if search_method == 'By Username':
-            if not sources_df.empty and 'username' in sources_df.columns:
-                user_list = sources_df['username'].tolist()
-                search_query = st.selectbox("Select username", user_list)
-            else:
-                # Extract unique usernames from merit data
-                givers = merit_df['giver_username'].unique().tolist()
-                receivers = merit_df['receiver_username'].unique().tolist()
-                user_list = list(set(givers + receivers))
-                user_list.sort()
-                search_query = st.selectbox("Select username", user_list)
-        else:
-            if not sources_df.empty and 'user_id' in sources_df.columns:
-                user_list = sources_df['user_id'].tolist()
-                search_query = st.selectbox("Select user ID", user_list)
-            else:
-                # Extract unique user IDs from merit data
-                givers = merit_df['giver_id'].unique().tolist()
-                receivers = merit_df['receiver_id'].unique().tolist()
-                user_list = list(set(givers + receivers))
-                user_list.sort()
-                search_query = st.selectbox("Select user ID", user_list)
-    
-    if search_query:
-        if search_method == 'By Username':
-            # Try to find user ID from sources data
-            if not sources_df.empty:
-                user_data = sources_df[sources_df['username'] == search_query]
-                if not user_data.empty:
-                    user_id = user_data['user_id'].iloc[0]
-                else:
-                    # Try to find in merit data
-                    user_given = merit_df[merit_df['giver_username'] == search_query]
-                    user_received = merit_df[merit_df['receiver_username'] == search_query]
-                    
-                    if not user_given.empty:
-                        user_id = user_given['giver_id'].iloc[0]
-                    elif not user_received.empty:
-                        user_id = user_received['receiver_id'].iloc[0]
-                    else:
-                        st.warning("User not found")
-                        return
-            else:
-                # Try to find in merit data
-                user_given = merit_df[merit_df['giver_username'] == search_query]
-                user_received = merit_df[merit_df['receiver_username'] == search_query]
-                
-                if not user_given.empty:
-                    user_id = user_given['giver_id'].iloc[0]
-                elif not user_received.empty:
-                    user_id = user_received['receiver_id'].iloc[0]
-                else:
-                    st.warning("User not found")
-                    return
-        else:
-            user_id = search_query
-            if not sources_df.empty:
-                user_data = sources_df[sources_df['user_id'] == user_id]
-                if not user_data.empty:
-                    search_query = user_data['username'].iloc[0]
-                else:
-                    # Try to find username in merit data
-                    user_given = merit_df[merit_df['giver_id'] == user_id]
-                    user_received = merit_df[merit_df['receiver_id'] == user_id]
-                    
-                    if not user_given.empty:
-                        search_query = user_given['giver_username'].iloc[0]
-                    elif not user_received.empty:
-                        search_query = user_received['receiver_username'].iloc[0]
-                    else:
-                        search_query = user_id
-            else:
-                # Try to find username in merit data
-                user_given = merit_df[merit_df['giver_id'] == user_id]
-                user_received = merit_df[merit_df['receiver_id'] == user_id]
-                
-                if not user_given.empty:
-                    search_query = user_given['giver_username'].iloc[0]
-                elif not user_received.empty:
-                    search_query = user_received['receiver_username'].iloc[0]
-                else:
-                    search_query = user_id
-        
-        # Filter merit data for this user
-        user_merit_given = merit_df[merit_df['giver_id'] == user_id]
-        user_merit_received = merit_df[merit_df['receiver_id'] == user_id]
-        
-        if user_merit_given.empty and user_merit_received.empty:
-            st.info(f"No merit activity found for {search_query} ({user_id})")
-            return
-        
-        # Display user metrics
-        st.markdown(f"### Merit Activity for {search_query} ({user_id})")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            total_given = user_merit_given['amount'].sum()
-            st.metric("Total Merit Given", f"{total_given:,}")
-        
-        with col2:
-            transactions_given = len(user_merit_given)
-            st.metric("Transactions Given", f"{transactions_given:,}")
-        
-        with col3:
-            total_received = user_merit_received['amount'].sum()
-            st.metric("Total Merit Received", f"{total_received:,}")
-        
-        with col4:
-            transactions_received = len(user_merit_received)
-            st.metric("Transactions Received", f"{transactions_received:,}")
-        
-        # Display recent activity
-        st.subheader("Recent Merit Given")
-        if not user_merit_given.empty:
-            recent_given = user_merit_given.sort_values('date', ascending=False).head(10)
-            st.dataframe(recent_given[['date', 'receiver_username', 'amount']], 
-                         column_config={
-                             "date": "Date",
-                             "receiver_username": "Receiver",
-                             "amount": "Amount"
-                         })
-        else:
-            st.info("No merit given activity found")
-        
-        st.subheader("Recent Merit Received")
-        if not user_merit_received.empty:
-            recent_received = user_merit_received.sort_values('date', ascending=False).head(10)
-            st.dataframe(recent_received[['date', 'giver_username', 'amount']], 
-                         column_config={
-                             "date": "Date",
-                             "giver_username": "Giver",
-                             "amount": "Amount"
-                         })
-        else:
-            st.info("No merit received activity found")
+    # Normalize
+    if amount is None:
+        amount = 1  # default single-merit if not specified
 
-# Main app function
-def main():
-    # Load data
-    merit_df, sources_df = load_data()
-    
-    # Calculate 30 days ago for filtering
-    thirty_days_ago = datetime.now() - timedelta(days=30)
-    recent_merit_df = merit_df[merit_df['date'] >= thirty_days_ago]
-    
-    # Display metrics
-    display_metrics(merit_df, recent_merit_df)
-    
-    # Prepare visualization data
-    top_sources_alltime, top_sources_recent, timeline_data, recent_merit_df = prepare_visualization_data(merit_df)
-    
-    # Create visualizations
-    fig_timeline, fig_top_alltime, fig_top_recent = create_visualizations(
-        timeline_data, top_sources_alltime, top_sources_recent
-    )
-    
-    # Display charts
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.plotly_chart(fig_timeline, use_container_width=True)
-        st.plotly_chart(fig_top_alltime, use_container_width=True)
-    
-    with col2:
-        # Display data tables
-        st.markdown('<div class="subheader">Top Merit Sources (All Time)</div>', unsafe_allow_html=True)
-        st.dataframe(
-            top_sources_alltime.head(20)[['giver_username', 'total_merit', 'total_transactions']],
-            column_config={
-                "giver_username": "Username",
-                "total_merit": "Total Merit",
-                "total_transactions": "Transactions"
-            },
-            height=400
+    return {
+        "from_id": from_id,
+        "to_id": to_id,
+        "amount": int(amount),
+        "date": date if not pd.isna(date) else pd.NaT,
+        "topic_id": topic_id,
+        "board_id": board_id,
+        "raw": s,
+    }
+
+@st.cache_data(show_spinner=False)
+def parse_text_to_df(raw_text: str, max_lines: int = None):
+    """
+    Parse the raw text file line by line into a DataFrame.
+    If max_lines is set, only parse that many lines (useful for testing).
+    """
+    records = []
+    # Try to iterate lines robustly
+    for i, line in enumerate(io.StringIO(raw_text)):
+        if max_lines and i >= max_lines:
+            break
+        parsed = parse_line(line)
+        if parsed:
+            records.append(parsed)
+    if not records:
+        return pd.DataFrame(
+            columns=["from_id", "to_id", "amount", "date", "topic_id", "board_id", "raw"]
         )
-        
-        st.markdown('<div class="subheader">Top Merit Sources (Last 30 Days)</div>', unsafe_allow_html=True)
-        st.dataframe(
-            top_sources_recent.head(20)[['giver_username', 'recent_merit', 'recent_transactions']],
-            column_config={
-                "giver_username": "Username",
-                "recent_merit": "Merit Given",
-                "recent_transactions": "Transactions"
-            },
-            height=400
-        )
-    
-    st.plotly_chart(fig_top_recent, use_container_width=True)
-    
-    # User search functionality
-    user_search(merit_df, sources_df)
-    
-    # Data export functionality
-    st.markdown("---")
-    st.markdown('<div class="subheader">Export Data</div>', unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("Export Top Sources (All Time) to CSV"):
-            csv = top_sources_alltime.to_csv(index=False)
-            st.download_button(
-                label="Download CSV",
-                data=csv,
-                file_name="top_merit_sources_all_time.csv",
-                mime="text/csv"
-            )
-    
-    with col2:
-        if st.button("Export Top Sources (30 Days) to CSV"):
-            csv = top_sources_recent.to_csv(index=False)
-            st.download_button(
-                label="Download CSV",
-                data=csv,
-                file_name="top_merit_sources_30_days.csv",
-                mime="text/csv"
-            )
-    
-    # Footer with last update time
-    st.markdown("---")
-    st.caption(f"Data last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-               "Data source: https://loyce.club/Merit/merit.all.txt")
+    df = pd.DataFrame.from_records(records)
+    # Normalize types
+    df["from_id"] = pd.to_numeric(df["from_id"], errors="coerce").astype("Int64")
+    df["to_id"] = pd.to_numeric(df["to_id"], errors="coerce").astype("Int64")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+    # date: ensure datetime
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["topic_id"] = pd.to_numeric(df["topic_id"], errors="coerce").astype("Int64")
+    df["board_id"] = pd.to_numeric(df["board_id"], errors="coerce").astype("Int64")
+    # drop rows missing both from and to
+    df = df.dropna(subset=["from_id", "to_id"], how="all").reset_index(drop=True)
+    return df
 
-# Run the app
-if __name__ == "__main__":
-    main()
+@st.cache_data(show_spinner=False)
+def load_or_process(force_download=False, force_parse=False):
+    """
+    Returns processed DataFrame.
+    Uses parquet cache if available and no force flags.
+    """
+    if os.path.exists(PROCESSED_PARQUET) and not (force_download or force_parse):
+        try:
+            df = pd.read_parquet(PROCESSED_PARQUET)
+            return df
+        except Exception:
+            pass
+
+    raw = download_raw(DATA_URL, force=force_download)
+    df = parse_text_to_df(raw)
+    # add derived columns
+    df["year"] = df["date"].dt.year
+    df["month"] = df["date"].dt.to_period("M")
+    # Save parquet for speed
+    try:
+        df.to_parquet(PROCESSED_PARQUET, index=False)
+    except Exception:
+        pass
+    return df
+
+# ---------------------
+# Streamlit UI
+# ---------------------
+st.title("Bitcointalk — Merit Data Dashboard")
+
+col1, col2 = st.columns([3, 1])
+with col1:
+    st.write("Source file:", DATA_URL)
+with col2:
+    st.button("Refresh data", key="refresh_button")
+
+# Options in sidebar
+st.sidebar.header("Controls")
+force_download = st.sidebar.checkbox("Force download fresh dump", value=False)
+force_parse = st.sidebar.checkbox("Force reparse", value=False)
+sample_mode = st.sidebar.checkbox("Sample mode (first 50k lines)", value=False)
+forum_base = st.sidebar.text_input("Forum topic base URL", value=FORUM_TOPIC_BASE)
+
+st.sidebar.markdown("Hints: if the dashboard is slow, enable sample mode or increase server memory.")
+
+# Load/process (show progress)
+with st.spinner("Loading and parsing data — this may take a moment for a large dump..."):
+    try:
+        df = load_or_process(force_download=force_download, force_parse=force_parse)
+    except Exception as e:
+        st.error(f"Failed to load data from the URL: {e}")
+        st.stop()
+
+if df.empty:
+    st.warning("No records parsed. The parser couldn't find recognizable merit entries.")
+    st.write("Show a few raw lines to help debugging:")
+    raw_preview = ""
+    try:
+        raw_preview = open(RAW_CACHE, "r", encoding="utf-8", errors="replace").read(10000)
+    except Exception:
+        raw_preview = "(no raw cache available)"
+    st.code(raw_preview[:5000])
+    st.stop()
+
+# Basic stats
+total_merits = int(df["amount"].sum())
+total_entries = len(df)
+unique_senders = int(df["from_id"].nunique(dropna=True))
+unique_receivers = int(df["to_id"].nunique(dropna=True))
+earliest = df["date"].min()
+latest = df["date"].max()
+
+st.metric("Total merit amount", f"{total_merits:,}")
+st.metric("Total entries (lines)", f"{total_entries:,}", delta=None)
+st.write(f"Unique senders: {unique_senders}, Unique receivers: {unique_receivers}")
+st.write(f"Date range: {earliest} to {latest}")
+
+# Sidebar filters
+st.sidebar.markdown("### Filters")
+min_date = st.sidebar.date_input("From date", value=earliest.date() if pd.notna(earliest) else None)
+max_date = st.sidebar.date_input("To date", value=latest.date() if pd.notna(latest) else None)
+user_search = st.sidebar.text_input("Search user id (exact) or partial username (not implemented)", value="")
+topic_filter = st.sidebar.text_input("Topic ID (comma-separated)", value="")
+board_filter = st.sidebar.text_input("Board ID (comma-separated)", value="")
+
+# Apply date filters
+filtered = df.copy()
+if min_date:
+    filtered = filtered[filtered["date"] >= pd.to_datetime(min_date)]
+if max_date:
+    filtered = filtered[filtered["date"] <= pd.to_datetime(max_date)]
+
+# Apply topic/board filters if provided
+def parse_id_list(s: str):
+    if not s:
+        return None
+    parts = re.findall(r"\d+", s)
+    return [int(x) for x in parts] if parts else None
+
+topic_ids = parse_id_list(topic_filter)
+board_ids = parse_id_list(board_filter)
+if topic_ids:
+    filtered = filtered[filtered["topic_id"].isin(topic_ids)]
+if board_ids:
+    filtered = filtered[filtered["board_id"].isin(board_ids)]
+
+# Leaderboards
+st.header("Leaderboards")
+lcol1, lcol2, lcol3 = st.columns(3)
+
+with lcol1:
+    st.subheader("Top receivers (by total merits)")
+    top_recv = (
+        filtered.groupby("to_id", dropna=True)["amount"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+        .rename(columns={"to_id": "user_id", "amount": "total_merits"})
+    )
+    st.dataframe(top_recv.head(50), height=350)
+
+with lcol2:
+    st.subheader("Top senders (by total merits given)")
+    top_sent = (
+        filtered.groupby("from_id", dropna=True)["amount"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+        .rename(columns={"from_id": "user_id", "amount": "total_given"})
+    )
+    st.dataframe(top_sent.head(50), height=350)
+
+with lcol3:
+    st.subheader("Top topics (by total merits)")
+    top_topics = (
+        filtered.groupby("topic_id", dropna=True)["amount"]
+        .sum()
+        .sort_values(ascending=False)
+        .reset_index()
+        .rename(columns={"topic_id": "topic_id", "amount": "total_merits"})
+    )
+    # Add link column if forum_base present
+    if forum_base:
+        top_topics["topic_link"] = top_topics["topic_id"].apply(
+            lambda tid: urljoin(forum_base, str(tid)) if not pd.isna(tid) else ""
+        )
+    st.dataframe(top_topics.head(50), height=350)
+
+# Charts
+st.header("Charts")
+
+# Merit over time (monthly)
+time_df = (
+    filtered.set_index("date")
+    .resample("M")["amount"]
+    .sum()
+    .rename("monthly_merits")
+    .reset_index()
+)
+if not time_df.empty:
+    fig_time = px.line(time_df, x="date", y="monthly_merits", title="Merits per month")
+    st.plotly_chart(fig_time, use_container_width=True)
+else:
+    st.write("No time-series data available for selected range.")
+
+# Top 10 bar charts
+st.subheader("Top 10 visualizations")
+bcol1, bcol2 = st.columns(2)
+
+with bcol1:
+    top10_recv = top_recv.head(10)
+    if not top10_recv.empty:
+        fig_r = px.bar(top10_recv, x="user_id", y="total_merits", title="Top 10 receivers")
+        st.plotly_chart(fig_r, use_container_width=True)
+    else:
+        st.write("No top receivers to show.")
+
+with bcol2:
+    top10_topics = top_topics.head(10)
+    if not top10_topics.empty:
+        fig_t = px.bar(top10_topics, x="topic_id", y="total_merits", title="Top 10 topics")
+        st.plotly_chart(fig_t, use_container_width=True)
+    else:
+        st.write("No top topics to show.")
+
+# Drill-down table and search by user id
+st.header("Explore entries")
+explore_user = st.text_input("Show entries for user id (from_id or to_id). Leave blank to show all.", value="")
+if explore_user.strip().isdigit():
+    uid = int(explore_user.strip())
+    entries = filtered[(filtered["from_id"] == uid) | (filtered["to_id"] == uid)].sort_values(
+        "date", ascending=False
+    )
+else:
+    entries = filtered.sort_values("date", ascending=False).head(500)
+
+# Add clickable topic links if possible (render as markdown)
+def make_topic_link(tid):
+    if pd.isna(tid):
+        return ""
+    return f"[{int(tid)}]({urljoin(forum_base, str(int(tid)))})" if forum_base else str(int(tid))
+
+if not entries.empty:
+    display_df = entries.copy()
+    display_df["topic_link"] = display_df["topic_id"].apply(make_topic_link)
+    display_df = display_df[
+        ["date", "from_id", "to_id", "amount", "topic_id", "topic_link", "board_id", "raw"]
+    ]
+    st.dataframe(display_df.reset_index(drop=True), height=450)
+else:
+    st.write("No entries match the current filters.")
+
+# Export options
+st.sidebar.header("Export")
+if st.sidebar.button("Download filtered as CSV"):
+    csv_bytes = filtered.to_csv(index=False).encode("utf-8")
+    st.sidebar.download_button("Download CSV", data=csv_bytes, file_name="merit_filtered.csv")
+
+st.sidebar.markdown("App created: simple robust parser + Streamlit UI.")
+st.sidebar.markdown("If the parser missed many entries, share a sample of the raw file for parser tuning.")
