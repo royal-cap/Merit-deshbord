@@ -37,6 +37,8 @@ st.markdown("""
         border-radius: 0.5rem;
         padding: 1rem;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        overflow: hidden;
+        perspective: 1px;
     }
     .stButton>button {
         width: 100%;
@@ -133,28 +135,17 @@ def parse_merit_sources(source_text):
 # Load data function
 def load_data():
     with st.spinner('Fetching latest merit data...'):
-        # Fetch merit data - trying multiple possible URLs
-        urls = [
-            "https://loyce.club/all_merit.txt",
-            "https://loyce.club/merit/all_merit.txt",
-            "https://loyce.club/meritdata/all_merit.txt"
-        ]
+        # Fetch merit data from the provided URL
+        merit_text = fetch_data("https://loyce.club/Merit/merit.all.txt")
         
-        merit_text = None
-        for url in urls:
-            merit_text = fetch_data(url)
-            if merit_text is not None:
-                break
-                
         if merit_text is None:
-            st.error("Failed to fetch merit data from all known URLs. Using sample data instead.")
+            st.error("Failed to fetch merit data. Using sample data instead.")
             return create_sample_data()
         
-        # Fetch merit sources - trying multiple possible URLs
+        # Try to fetch merit sources from possible URLs
         source_urls = [
             "https://loyce.club/merit_sources.txt",
-            "https://loyce.club/merit/merit_sources.txt",
-            "https://loyce.club/meritdata/merit_sources.txt"
+            "https://loyce.club/Merit/merit_sources.txt"
         ]
         
         sources_text = None
@@ -344,8 +335,12 @@ def user_search(merit_df, sources_df):
                 user_list = sources_df['username'].tolist()
                 search_query = st.selectbox("Select username", user_list)
             else:
-                st.info("No username data available")
-                return
+                # Extract unique usernames from merit data
+                givers = merit_df['giver_username'].unique().tolist()
+                receivers = merit_df['receiver_username'].unique().tolist()
+                user_list = list(set(givers + receivers))
+                user_list.sort()
+                search_query = st.selectbox("Select username", user_list)
         else:
             if not sources_df.empty and 'user_id' in sources_df.columns:
                 user_list = sources_df['user_id'].tolist()
@@ -360,12 +355,12 @@ def user_search(merit_df, sources_df):
     
     if search_query:
         if search_method == 'By Username':
+            # Try to find user ID from sources data
             if not sources_df.empty:
                 user_data = sources_df[sources_df['username'] == search_query]
                 if not user_data.empty:
                     user_id = user_data['user_id'].iloc[0]
                 else:
-                    st.warning("User not found in sources data")
                     # Try to find in merit data
                     user_given = merit_df[merit_df['giver_username'] == search_query]
                     user_received = merit_df[merit_df['receiver_username'] == search_query]
@@ -557,7 +552,7 @@ def main():
     # Footer with last update time
     st.markdown("---")
     st.caption(f"Data last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-               "Data source: https://loyce.club/")
+               "Data source: https://loyce.club/Merit/merit.all.txt")
 
 # Run the app
 if __name__ == "__main__":
